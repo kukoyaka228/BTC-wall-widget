@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC Live Board — Binance (Stable v2)</title>
+<style>
+  :root{ --bg:#000; --fg:#fff; --muted:#777; --up:#00c853; --down:#ff5252; --card:#0a0a0a; --warn:#ffab00; }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace,Menlo,Consolas,monospace}
+  .wrap{display:grid;grid-template-rows:2fr 1fr;height:100vh}
+  #top{position:relative;display:flex;align-items:center;justify-content:center;height:66vh;overflow:hidden}
+  #pwrap{transform:scaleY(1.20);} #p{white-space:nowrap;line-height:1;letter-spacing:-.02em;text-shadow:0 0 24px rgba(255,255,255,.06);will-change:transform}
+  #mini{position:absolute;left:2vh;top:2vh;color:var(--muted);font-size:2.6vmin}
+  #ts{position:absolute;right:2vh;top:2vh;color:var(--muted);font-size:2.6vmin}
+  #nightBtn{position:absolute;right:2vh;bottom:2vh;font-size:2.4vmin;padding:.8vmin 1.2vmin;border:1px solid #222;border-radius:10px;background:#0a0a0a;color:#ddd}
+  #nightBtn.on{background:#162029;color:#d4ecff;border-color:#203445}
+  #bottom{height:34vh;padding:1.6vh 2vh 2vh 2vh;display:grid;gap:1.2vh;grid-template-columns:repeat(6,1fr);grid-auto-rows:1fr}
+  .card{background:var(--card);border:1px solid #111;border-radius:12px;padding:1.4vh 1.2vh;display:flex;flex-direction:column;justify-content:space-between}
+  .h{font-size:1.9vmin;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .v{font-size:3.2vmin}.s{font-size:2.2vmin;color:var(--muted)}.up{color:var(--up)}.down{color:var(--down)}.warn{color:var(--warn)}
+  #flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .25s ease}
+  #dim{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;transition:opacity .4s ease}
+  @media (max-aspect-ratio: 10/13){#bottom{grid-template-columns:repeat(3,1fr)}.h{font-size:2.2vmin}.v{font-size:3.8vmin}.s{font-size:2.4vmin}}
+</style>
+<div class="wrap">
+  <div id="top">
+    <div id="mini">BTC/USDT<span id="src" class="s"></span></div>
+    <div id="pwrap"><div id="p">—</div></div>
+    <div id="ts">—</div>
+    <button id="nightBtn" title="Night dim">🌙 Night</button>
+  </div>
+  <div id="bottom">
+    <div class="card"><div class="h">24h Change</div><div class="v" id="chg">—</div><div class="s" id="vol">Vol: —</div></div>
+    <div class="card"><div class="h">Spread</div><div class="v" id="spr">—</div><div class="s" id="ba">Bid — / Ask —</div></div>
+    <div class="card"><div class="h">Funding</div><div class="v" id="fund">—</div><div class="s" id="fundEta">Next in —</div></div>
+    <div class="card"><div class="h">Liquidations (Futures)</div><div class="v" id="liq15">15m — / —</div><div class="s" id="liq1">1m — / —</div></div>
+    <div class="card"><div class="h">Fear & Greed</div><div class="v" id="fng">—</div><div class="s" id="fngt">—</div></div>
+    <div class="card"><div class="h">AI-like Signal</div><div class="v" id="sig">—</div><div class="s" id="sig2">EMA21/55 · RSI14</div></div>
+  </div>
+</div>
+<div id="flash"></div>
+<div id="dim"></div>
+<script>
+const CFG = {
+  spotTicker:   'wss://stream.binance.com:9443/ws/btcusdt@ticker',
+  spotBook:     'wss://stream.binance.com:9443/ws/btcusdt@bookTicker',
+  futMark:      'wss://fstream.binance.com/ws/btcusdt@markPrice@1s',
+  // use aggregate liquidation stream to guarantee events and filter BTCUSDT client-side
+  futLiqAll:    'wss://fstream.binance.com/stream?streams=!forceOrder@arr',
+  useMark:  false,
+  alertLevels: [], largeLiqUSD: 1000000, change1mAlert: 0.5, drift: 6,
+  night: { auto:true, start:'22:30', end:'07:00', dim:0.65, breatheEveryMin: 10, breatheMs: 1200, breatheDepth: 0.15 }
+};
+const el = {
+  p:document.getElementById('p'), ts:document.getElementById('ts'),
+  chg:document.getElementById('chg'), vol:document.getElementById('vol'),
+  spr:document.getElementById('spr'), ba:document.getElementById('ba'),
+  fund:document.getElementById('fund'), fundEta:document.getElementById('fundEta'),
+  liq15:document.getElementById('liq15'), liq1:document.getElementById('liq1'),
+  fng:document.getElementById('fng'), fngt:document.getElementById('fngt'),
+  sig:document.getElementById('sig'), sig2:document.getElementById('sig2'),
+  flash:document.getElementById('flash'), dim:document.getElementById('dim'),
+  nightBtn:document.getElementById('nightBtn'), src:document.getElementById('src'),
+  top:document.getElementById('top')
+};
+const S={ lastSpot:null,last1mBase:null,bid:null,ask:null,pct24:null,qvol24:null,mark:null,fundingT:null,liq:[],closes5s:[],ema21:null,ema55:null,rsi14:null, nightOn:false, lastBreatheT:Date.now() };
+function fmtUSD(n,d=0){ if(!isFinite(n)) return '—'; return Number(n).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function fmtPct(n){ if(!isFinite(n)) return '—'; return (n>=0?'+':'')+n.toFixed(2)+'%'; }
+function setUD(e,v){ e.classList.remove('up','down'); if(isFinite(v)) e.classList.add(v>=0?'up':'down'); }
+function now(){ return Date.now(); }
+function fitPrice(){ const box=el.top.getBoundingClientRect(); const maxH=box.height*0.90, maxW=box.width*0.98;
+  el.p.style.fontSize=Math.floor(maxH)+'px'; const sw=el.p.scrollWidth;
+  if(sw>maxW) el.p.style.fontSize=Math.floor(parseFloat(el.p.style.fontSize)*(maxW/sw))+'px'; }
+addEventListener('resize', fitPrice);
+setInterval(()=>{ const x=Math.floor(Math.random()*CFG.drift)-CFG.drift/2, y=Math.floor(Math.random()*CFG.drift)-CFG.drift/2; el.p.style.transform=`translate(${x}px,${y}px)`; },1200);
+function setPrice(n){ if(!isFinite(n)) return; S.lastSpot=n; el.p.textContent=n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); el.ts.textContent=new Date().toLocaleTimeString(); fitPrice(); }
+function setMark(n){ if(isFinite(n)){ S.mark=n; if(CFG.useMark) setPrice(n); } }
+function ws(url, onmsg){
+  let s, watchInt; const connect=()=>{ s=new WebSocket(url); let last=Date.now();
+    s.onmessage=e=>{ last=Date.now(); try{ onmsg(JSON.parse(e.data)); }catch{} };
+    s.onclose=()=>{ clearInterval(watchInt); setTimeout(connect,1500); };
+    s.onerror=()=>{ try{s.close()}catch{}; };
+    watchInt=setInterval(()=>{ if(Date.now()-last>30000){ try{s.close()}catch{}; } },10000);
+  }; connect();
+}
+ws(CFG.spotTicker, m=>{
+  const c=parseFloat(m.c), P=parseFloat(m.P), q=parseFloat(m.q);
+  if(!CFG.useMark) setPrice(c);
+  S.pct24=P; S.qvol24=q; el.chg.textContent=fmtPct(P); setUD(el.chg,P); el.vol.textContent='Vol: $'+fmtUSD(q,0);
+  if(!S.last1mBase) S.last1mBase=c;
+});
+ws(CFG.spotBook, m=>{
+  S.bid=parseFloat(m.b); S.ask=parseFloat(m.a);
+  const spread=(S.ask-S.bid); const bps=S.bid?(spread/S.bid*10000):0;
+  el.spr.textContent = `$${fmtUSD(spread,2)} · ${bps.toFixed(1)} bps`;
+  el.ba.textContent  = `Bid $${fmtUSD(S.bid,2)} / Ask $${fmtUSD(S.ask,2)}`;
+});
+ws(CFG.futMark, m=>{
+  const mark=parseFloat(m.p), fr=parseFloat(m.r), T=m.T;
+  setMark(mark); if(isFinite(fr)) el.fund.textContent=(fr*100).toFixed(4)+'%'; if(T) S.fundingT=T;
+});
+setInterval(()=>{ if(!S.fundingT) return;
+  const dt=Math.max(0,S.fundingT-now()); const hh=Math.floor(dt/3600000), mm=Math.floor((dt%3600000)/60000), ss=Math.floor((dt%60000)/1000);
+  el.fundEta.textContent=`Next in ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+},1000);
+
+/* NEW: aggregate liquidation stream, filter BTCUSDT */
+(function(){
+  let s, watchInt;
+  const url = CFG.futLiqAll;
+  const connect=()=>{
+    s = new WebSocket(url);
+    let last=Date.now();
+    s.onmessage=e=>{
+      last=Date.now();
+      try{
+        const msg = JSON.parse(e.data); // {stream:"!forceOrder@arr", data:{...same as single}}
+        const m = msg.data || msg; // fallback
+        const o = m.o || (m.data && m.data.o);
+        if(!o) return;
+        if(o.s !== 'BTCUSDT') return; // filter by our pair
+        const side = (o.S==='SELL') ? 'LONG' : 'SHORT';
+        const qty = parseFloat(o.q||o.l||0);
+        const price = parseFloat(o.ap||o.p||0);
+        const usd = qty*price;
+        if(isFinite(usd) && usd>0){
+          S.liq.push({ts:now(), usd, side});
+          if(usd >= 1_000_000) flash();
+        }
+      }catch{}
+    };
+    s.onclose=()=>{ clearInterval(watchInt); setTimeout(connect,1500); };
+    s.onerror=()=>{ try{s.close()}catch{}; };
+    watchInt=setInterval(()=>{ if(Date.now()-last>30000){ try{s.close()}catch{}; } },10000);
+  };
+  connect();
+})();
+
+function updLiq(){ const t=now(), cut15=t-900000, cut1=t-60000; S.liq=S.liq.filter(x=>x.ts>=cut15);
+  let L15=0,S15=0,L1=0,S1=0; for(const e of S.liq){ if(e.side==='LONG'){ if(e.ts>=cut15)L15+=e.usd; if(e.ts>=cut1)L1+=e.usd; } else { if(e.ts>=cut15)S15+=e.usd; if(e.ts>=cut1)S1+=e.usd; } }
+  el.liq15.innerHTML=`15m <span class="down">Longs</span> $ ${fmtUSD(L15,0)} / <span class="up">Shorts</span> $ ${fmtUSD(S15,0)}`;
+  el.liq1.innerHTML =`1m <span class="down">Longs</span> $ ${fmtUSD(L1,0)} / <span class="up">Shorts</span> $ ${fmtUSD(S1,0)}`; }
+setInterval(updLiq,3000);
+
+async function fng(){ try{ const r=await fetch('https://api.alternative.me/fng/?limit=1'); const j=await r.json(); const d=j&&j.data&&j.data[0];
+  if(!d) return; el.fng.textContent=`${d.value} — ${d.value_classification}`; const t=new Date(parseInt(d.timestamp,10)*1000); el.fngt.textContent=t.toLocaleDateString()+' '+t.toLocaleTimeString(); }catch{} }
+fng(); setInterval(fng,600000);
+
+function push5sClose(){ const px=(CFG.useMark&&isFinite(S.mark))?S.mark:S.lastSpot; if(!isFinite(px)) return;
+  S.closes5s.push(px); if(S.closes5s.length>600) S.closes5s.shift();
+  const ema=(prev,price,p)=> prev==null?price:prev+(2/(p+1))*(price-prev); S.ema21=ema(S.ema21,px,21); S.ema55=ema(S.ema55,px,55);
+  if(S.closes5s.length>1){ let g=0,l=0,n=0; for(let i=Math.max(1,S.closes5s.length-14);i<S.closes5s.length;i++){ const ch=S.closes5s[i]-S.closes5s[i-1]; if(ch>0)g+=ch; else l+=-ch; n++; }
+    const avgG=g/Math.max(1,n), avgL=l/Math.max(1,n), rs=avgL===0?100:avgG/avgL; S.rsi14=100-(100/(1+rs)); }
+  let sig='—', detail=''; if(S.ema21!=null&&S.ema55!=null){ if(Math.abs(S.ema21-S.ema55)/px<0.0008) sig='RANGE'; else sig=(S.ema21>S.ema55)?'UPTREND':'DOWNTREND';
+    detail=`EMA21 ${S.ema21.toFixed(2)} / EMA55 ${S.ema55.toFixed(2)} · RSI ${S.rsi14?S.rsi14.toFixed(1):'—'}`; }
+  el.sig.textContent=sig; el.sig.className='v '+(sig==='UPTREND'?'up':sig==='DOWNTREND'?'down':'warn'); el.sig2.textContent=detail; }
+setInterval(push5sClose,5000);
+
+setInterval(()=>{ const px=(CFG.useMark&&isFinite(S.mark))?S.mark:S.lastSpot; if(!isFinite(px)) return;
+  if(!S.last1mBase){ S.last1mBase=px; return; } const d=(px-S.last1mBase)/S.last1mBase*100; if(Math.abs(d)>=CFG.change1mAlert) flash(); S.last1mBase=px; },60000);
+
+setInterval(()=>{ if(!CFG.alertLevels.length) return; const px=(CFG.useMark&&isFinite(S.mark))?S.mark:S.lastSpot; if(!isFinite(px)) return;
+  for(const L of CFG.alertLevels){ if(Math.abs(px-L)/L<0.0005) flash(); } },1000);
+
+let flashTimer=null; function flash(){ el.flash.style.opacity='0.6'; clearTimeout(flashTimer); flashTimer=setTimeout(()=>el.flash.style.opacity='0',180); }
+
+function parseHM(hm){ const [h,m]=hm.split(':').map(Number); return {h,m}; }
+function inNightWindow(d=new Date()){ const s=parseHM(CFG.night.start), e=parseHM(CFG.night.end); const t=d.getHours()*60+d.getMinutes(), ts=s.h*60+s.m, te=e.h*60+e.m;
+  return ts<=te ? (t>=ts && t<te) : (t>=ts || t<te); }
+function applyNight(on){ el.nightBtn.classList.toggle('on',on); el.dim.style.opacity=on?String(CFG.night.dim):'0'; }
+let nightOn=false, lastBreatheT=Date.now();
+function maybeNight(){ const should=CFG.night.auto?inNightWindow():nightOn; applyNight(should);
+  if(should && CFG.night.breatheEveryMin){ const ms=CFG.night.breatheEveryMin*60000; if(Date.now()-lastBreatheT>=ms){ lastBreatheT=Date.now();
+    el.p.style.transition='filter '+CFG.night.breatheMs+'ms ease'; el.p.style.filter='brightness('+(1-CFG.night.breatheDepth)+')'; setTimeout(()=>{ el.p.style.filter='brightness(1)'; }, CFG.night.breatheMs); }}}
+setInterval(maybeNight,30000);
+document.getElementById('nightBtn').onclick=()=>{ nightOn=!nightOn; applyNight(nightOn); };
+
+el.src.textContent=' · Binance WS';
+</script>
+</html>
